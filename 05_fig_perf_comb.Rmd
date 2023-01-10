@@ -1,0 +1,72 @@
+---
+title: "Create a combined performance plot for both case studies"
+author: "Gary Weissman / Negin Faraji"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+This is a revised analysis of the NLST data for the case study #2. It uses the file `data_ready_binary.csv` that Negin created from the original NLST data files.
+
+```{r libs, message=FALSE, warning=FALSE}
+library(data.table)
+library(gmish)
+library(ggplot2)
+library(ggsci)
+library(ggpubr)
+library(patchwork)
+library(cowplot)
+
+set.seed(1234)
+```
+
+```{r loaddata}
+nlst_res <- fread('output/nlst_res.csv')
+hirid_res <- fread('output/hirid_test_predictions.csv.gz')
+# Clean up names
+setnames(hirid_res, c('vented', 'Elastic net', 'Naive Bayes', 'XGBoost'))
+```
+
+```{r final plot}
+
+cal_pl_hirid <- calib_plot(vented ~ `Elastic net` + `Naive Bayes` + XGBoost, 
+                           data = hirid_res, cuts = 6) + 
+  theme(legend.position = "none") + 
+  ggtitle('Mechanical Ventilation - Calibration') +
+  theme(plot.title = element_text(size = 12)) + 
+  scale_color_nejm()
+
+pr_pl_hirid <- pr_plot(vented ~ `Elastic net` + `Naive Bayes` + XGBoost, 
+                       data = hirid_res) + 
+  theme(legend.position = "none") + 
+  ggtitle('Mechanical Ventilation - Discrimination') +
+  theme(plot.title = element_text(size = 12)) +
+  scale_color_nejm()
+
+cal_pl_nlst <- calib_plot(y ~  en + naive+ xgb, data = nlst_res, cuts = 6) + 
+  theme(legend.position = "none") + 
+  ggtitle('Lung Cancer - Calibration') +
+  theme(plot.title = element_text(size = 12)) +
+  scale_color_nejm()
+
+pr_pl_nlst <- pr_plot(y ~  en + naive+ xgb, data = nlst_res) + 
+  theme(legend.position = "none") + 
+  ggtitle('Lung Cancer - Discrimination') +
+  theme(plot.title = element_text(size = 12)) +
+  scale_color_nejm()
+
+ggarrange(    pr_pl_hirid , cal_pl_hirid,
+              pr_pl_nlst, cal_pl_nlst , 
+                      #labels = c('HIRID','NLST'),
+                      nrow = 2 , ncol=2 , common.legend = TRUE, 
+              legend = "bottom")
+
+ggsave("exhibit/fig_perf_comb_v2.png", width = 10, height = 10, dpi = 300)
+```
+

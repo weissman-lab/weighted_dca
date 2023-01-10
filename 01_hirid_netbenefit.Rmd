@@ -1,0 +1,318 @@
+---
+title: "Net Benefit Calculations"
+author: "Gary E. Weissman, MD, MSHP"
+date: "6/24/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+The goal of this study is to determine when it would be worthwhile to do the work to determine utilities for predicted outcomes (e.g. false positive vs false negative errors) and when using a net-benefit approach would give equivalent results.
+
+Note that net benefit analysis (Vickers MDM 2006) is *not* meant to be used for bedside decision making, and is *not* meant to determine a threshold. Rather, a range of thresholds are meant to be determined using clinical judgement and the decision curve is meant to inform which models are optimal over those ranges. See Vicker's clarification here: https://doi.org/10.1186/s41512-019-0064-7
+
+While this approach is *easier* than doing the work of obtaining end-user utilities, it conflates the part-worth utilities of different outcomes with an optimal classification threshold. Therefore we seek to see to what degree model outcomes are imbalanced would yield different interpretations of optimal models.
+
+Also consider that the classification threshold has an impact of fairness. Note that estimation of utilities may also lead to different stakeholders having divergent weights, and thus may prefer different models.
+
+## Data
+
+Using the HIRID case study, build a prediction model and choose the "best" using DCA. Then *weight* the benefits and see if we get the same answers.
+
+```{r libraries}
+library(data.table)
+library(R.utils)
+library(ggplot2)
+library(caret)
+library(gmish)
+library(ggsci)
+library(table1)
+library(patchwork)
+library(cowplot)
+library(MASS)
+library(xgboost)
+library(naivebayes)
+library(doFuture)
+registerDoFuture()
+plan(multisession, workers = availableCores() - 1)
+set.seed(24601)
+```
+
+## Case study 1: Predicting vent need in the ICU
+
+Predict need for mechanical ventilation (vm62) since mortality is apparently not available based on the first 24 hours of clinical data in the HIRID dataset. Exclude patients intubated within the first 24 hours. See data dictionary here: https://hirid.intensivecare.ai/Data-details-1ff9c433b9894904b1dbd7652be4b11c
+
+```{r hirid, warning=FALSE}
+fname_lst <- list.files('/data/hirid_v1.0/merged_stage/merged_stage/csv/', full.names = TRUE)
+hirid_dt <- rbindlist(lapply(fname_lst, fread))
+
+# Use these vars
+var_names <- c(patientid = 'patientid', datetime = 'datetime',
+               vm1 = 'heart_rate', vm3 = 'sbp_invasive', vm20 = 'spo2',
+               vm28 = 'rass', vm62 = 'pip', vm146 = 'lactate_venous', 
+               vm172 = 'inr', vm174 = 'glucose_serum')
+hirid_dt <- hirid_dt[, names(var_names), with = FALSE]
+setnames(hirid_dt, var_names)
+
+# Create some helpful features
+hirid_dt[, datetime_dt := as.POSIXct(datetime)]
+hirid_dt[, first_record := min(datetime_dt), by = patientid]
+hirid_dt[, last_record := max(datetime_dt), by = patientid]
+hirid_dt[, in_first_24h := as.numeric(datetime_dt - first_record, 
+                                      units = 'hours') <= 24 , by = patientid]
+hirid_dt[, los_hrs := as.numeric(last_record - first_record,
+                                 units = 'hours'), by = patientid]
+
+# Remove observations with LOS < 24h
+hirid_dt <- hirid_dt[los_hrs >= 24]
+
+# generate the outcome variable for ever on the vent
+hirid_dt[, ever_on_vent := as.numeric(any(! is.na(pip))), by = patientid]
+y_dt <- unique(hirid_dt[, .(patientid, ever_on_vent)])
+
+# Drop everything outside of first 24 h
+hirid_dt <- hirid_dt[in_first_24h == TRUE]
+
+# Now get worst value in first 24h
+hirid_worst24_dt <- hirid_dt[, .(hr_highest = max(heart_rate, na.rm = TRUE),
+                                 hr_sd = sd(heart_rate, na.rm = TRUE),
+                                 sbp_lowest = min(sbp_invasive, na.rm = TRUE),
+                                 sbp_sd = sd(sbp_invasive, na.rm = TRUE),
+                                 spo2_lowest = min(spo2, na.rm = TRUE),
+                                 spo2_sd = sd(spo2, na.rm = TRUE),
+                                 rass_lowest = min(rass, na.rm = TRUE),
+                                 rass_sd = sd(rass, na.rm = TRUE),
+                                 glucose_lowest = min(glucose_serum, na.rm = TRUE),
+                                 glucose_sd = sd(glucose_serum, na.rm = TRUE),
+                                 lactate_highest = max(lactate_venous, na.rm = TRUE),
+                                 lactate_highest_sd = sd(lactate_venous, na.rm = TRUE),
+                                 inr_highest = max(inr, na.rm = TRUE),
+                                 inr_highest_sd = sd(inr, na.rm = TRUE),
+                                 on_vent_within_24h = any(! is.na(pip))),
+                             by = patientid]
+# Remove observations where patient was intubated in first 24h
+hirid_worst24_dt <- hirid_worst24_dt[on_vent_within_24h == FALSE]
+
+
+# Now just median impute any missing
+hirid_worst24_dt <- as.data.table(lapply(hirid_worst24_dt, function(col) {
+  col[is.na(col) | is.infinite(col)] <- median(col[is.finite(col)], na.rm = TRUE)
+  return(col)
+}))
+
+# Merge back with outcomes
+hirid_worst24_dt <- merge(hirid_worst24_dt, y_dt, by = 'patientid', all.x = TRUE)
+#merge for sex and age 
+general_dt <- fread('/data/hirid_v1.0/general_table.csv')
+general_dt <- general_dt[,c(1,3,4)]
+hirid_worst24_dt <- merge(hirid_worst24_dt, general_dt, by = 'patientid', all.x = TRUE)
+
+# Check no missingness
+summary(hirid_worst24_dt)
+
+# Remove initial dt to save some memory for training
+rm(hirid_dt)
+gc()
+
+# Split into train and test
+idx_train <- sample(nrow(hirid_worst24_dt), 
+                    size = round(0.8 * nrow(hirid_worst24_dt)), 
+                    replace = FALSE)
+
+```
+
+Summarize the data.
+
+```{r summdata}
+table1(~ factor(sex) + age + on_vent_within_24h, data =  hirid_worst24_dt)
+
+table1(~ factor(sex) + age + on_vent_within_24h | dataset, data =  data.table(hirid_worst24_dt, 
+                                                                    dataset = ifelse(seq_along(1:nrow(hirid_worst24_dt)) %in% idx_train, 'train', 'test')))
+
+# Remove other vars not for  prediction
+hirid_worst24_dt[, on_vent_within_24h := NULL]
+```
+
+
+Now build two models for comparison.
+
+```{r hirid_models, warning=FALSE}
+my_control <- trainControl(method = "boot",
+                           number = 100,
+                           classProbs = TRUE,
+                           returnData = TRUE,
+                           returnResamp = 'all',
+                           savePredictions = TRUE,
+                           summaryFunction = mnLogLoss)
+
+# ------------------- Train elastic net model
+grid_en <- expand.grid(alpha = seq(0,1,.1),
+                       lambda = c(0.0001, 0.001, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 1, 3, 5))
+
+mod_hirid_en <- caret::train(as.factor(make.names(ever_on_vent)) ~ .^2, # include interaction terms
+                      method = 'glmnet',
+                      family = 'binomial',
+                      trControl = my_control,
+                      tuneGrid = grid_en,
+                      metric = 'logLoss',
+                      data = hirid_worst24_dt[idx_train, -1])
+
+preds_hirid_en <- predict(mod_hirid_en, newdata = hirid_worst24_dt[-idx_train], type = 'prob')[,2]
+plot(mod_hirid_en)
+
+# ------------------- Train XGB model
+grid_xgb <- expand.grid(nrounds = c(100, 200), 
+                        max_depth = 1:3 * 2, 
+                        eta = c(0.3, 0.2, 0.1),
+                        gamma = 0, 
+                        colsample_bytree = 1, 
+                        min_child_weight = 1, 
+                        subsample = c(1))
+
+mod_hirid_xgb <- train(as.factor(make.names(ever_on_vent)) ~ .^2,
+                    method = 'xgbTree',
+                    trControl = my_control,
+                    tuneGrid = grid_xgb,
+                    metric = 'logLoss',
+                    data = hirid_worst24_dt[idx_train,-1], verbosity = 0)
+preds_hirid_xgb <- predict(mod_hirid_xgb, newdata = hirid_worst24_dt[-idx_train], type = 'prob')[,2]
+plot(mod_hirid_xgb)
+
+```
+
+
+```{r svm, warning=FALSE, eval = FALSE}
+# ------------------- Train SVM model
+grid_svm <- expand.grid(C = seq(0, 2, length = 10))
+
+mod_hirid_svm <- train(as.factor(make.names(ever_on_vent)) ~ .^2,
+                       method = "svmLinear", 
+                       trControl = my_control,  
+                       tuneGrid = grid_svm,
+                       preProcess = c("center","scale"),
+                        metric = 'logLoss',
+                       data = hirid_worst24_dt[idx_train,-1], verbosity = 0)
+
+preds_hirid_svm <- predict(mod_hirid_svm, newdata = hirid_worst24_dt[-idx_train], type = 'prob')[,2]
+plot(mod_hirid_svm)
+```
+```{r}
+#fwrite(preds_hirid_en, 'output/preds_hirid_en.csv.gz')
+#fwrite(preds_hirid_xgb, 'output/preds_hirid_xgb.csv.gz')
+#fwrite(preds_hirid_svm, 'output/preds_hirid_svm.csv.gz')
+#save(mod_hirid_en, mod_hirid_xgb, mod_hirid_svm, file = 'output/hirid_model_objects.RData')
+```
+
+```{r naivebayes}
+# ------------------- Train XGB model
+
+grid_naive <- expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 0.3, 0.5, 0.8, 1), 
+                         adjust = c(0.25, 0.50, 0.75, 1, 1.25, 1.5, 1.75, 2.0))
+
+mod_hirid_naive <- train(as.factor(make.names(ever_on_vent)) ~ .,
+                      method = 'naive_bayes',
+                      trControl = my_control,
+                      tuneGrid = grid_naive,
+                      usepoisson = TRUE,
+                      metric = 'logLoss',
+                      data = hirid_worst24_dt[idx_train,-1])
+preds_hirid_naive <- predict(mod_hirid_naive, newdata = hirid_worst24_dt[-idx_train], type = 'prob')[,2]
+plot(mod_hirid_naive)
+```
+
+Look at performance of the models.
+
+```{r perf_mod_hirid}
+hirid_res <- data.table(vented = hirid_worst24_dt[-idx_train]$ever_on_vent,
+                        mod_en = preds_hirid_en,
+                        mod_naive = preds_hirid_naive,
+                        #mod_svm = preds_hirid_svm,
+                        mod_xgb = preds_hirid_xgb)
+fwrite(hirid_res, 'output/hirid_test_predictions.csv.gz')
+
+# Calibration plot
+cal_pl <- calib_plot(vented ~ mod_en + mod_naive  + mod_xgb, 
+                     data = hirid_res, cuts = 6) #+ mod_naive #, rug = TRUE
+pr_pl <- pr_plot(vented ~ mod_en + mod_naive + mod_xgb, data = hirid_res)
+
+library(cowplot)
+plot_grid(pr_pl, cal_pl, labels = "AUTO")
+cowplot::plot_grid(
+   cowplot::plot_grid(
+    pr_pl + scale_color_discrete(guide = FALSE),
+    cal_pl + scale_color_discrete(guide = FALSE),
+    ncol = 2, align = "v"
+   ),
+   cowplot::get_legend(cal_pl + scale_shape(guide = FALSE) + 
+      theme(legend.position = "bottom")),
+   ncol=1, rel_heights=c(.85, .15))
+   
+   ggsave('exhibit/fig_hirid_perf_all.png', width = 12, height = 7, dpi = 600)
+
+# AUC
+print(paste('AUC for the EN model: ', cstat(preds_hirid_en, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('AUC for the Naive Bayes model: ', cstat(preds_hirid_naive, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+#print(paste('AUC for the SVM model: ', cstat(preds_hirid_svm, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('AUCfor the XGBoost model: ', cstat(preds_hirid_xgb, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+
+
+# Scaled brier score
+print(paste('Scaled brier score for the EN model: ',  sbrier(preds_hirid_en, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('Scaled brier score for the Naive Bayes model: ',  sbrier(preds_hirid_naive, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+#print(paste('Scaled brier score SVM model: ', sbrier(preds_hirid_svm, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('Scaled brier score for the XGB model: ',  sbrier(preds_hirid_xgb, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+
+
+# logloss
+print(paste('loglossfor the EN model: ', lloss(preds_hirid_en, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('logloss for the Naive Bayes model: ', lloss(preds_hirid_naive, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+#print(paste('logloss for the SVM model: ', lloss(preds_hirid_svm, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+print(paste('logloss for the XGBoost model: ', lloss(preds_hirid_xgb, hirid_worst24_dt[-idx_train]$ever_on_vent)))
+
+
+```
+
+Now compare the decision analysis curves.
+
+```{r dca_hirid, eval = FALSE}
+
+# This plotting approach is DEPRECATED -- see the next notebook for the definitive approach
+
+# Set range of weights
+weight_list <- c(1/8, 1/7, 1/6, 1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5, 6, 7, 8)
+dca_list <- lapply(weight_list, function(w) {
+  nb_plot(vented ~ mod_en + mod_naive + mod_xgb, weight = w,
+                     data = hirid_res) + 
+    theme(legend.position="none") +
+                     ggtitle(paste0('Weight: ', fractions(w))) +
+    theme(text = element_text(size = 10))
+})
+# Collect legends with cowplot: https://wilkelab.org/cowplot/articles/shared_legends.html
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  dca_list[[1]] + theme(legend.position = "bottom")
+)
+pg <- plot_grid(plotlist = dca_list, 
+          ncol = 5, align = "hv")
+plot_grid(pg, legend, ncol = 1, rel_heights = c(1, .1))
+
+# Patchwork not formatting well
+# Reduce(f = `+`,
+#       x = dca_list) + plot_layout(nrow = 3, 
+#                                   guides = "collect")  & theme(legend.position = 'bottom')
+
+ggsave('exhibit/fig_hirid_dca_all.png', width = 12, height = 12, dpi = 600)
+```
+
+
+```{r stop}
+
+plan(sequential)
+
+```

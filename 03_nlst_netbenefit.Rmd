@@ -1,0 +1,295 @@
+---
+title: 'Case Study #2: NLST Analysis'
+author: "Negin Faraji"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+This is a revised analysis of the NLST data for the case study #2. It uses the file `data_ready_binary.csv` that Negin created from the original NLST data files.
+
+```{r libs}
+library(data.table)
+library(caret)
+library(gmish)
+library(ggplot2)
+library(ggsci)
+library(foreach)
+library(future)
+library(doFuture)
+library(patchwork)
+library(MASS)
+library(cowplot)
+library(dplyr)
+library(table1)
+library(missMethods)
+library(recipes)
+library(themis)
+registerDoFuture()
+plan(multisession, workers = availableCores() - 1)
+set.seed(24601)
+```
+
+
+```{r data, warning=FALSE}
+dd <- fread('data/data_ready_binary.csv') 
+
+# Clean up some rare categories
+colSums(is.na(dd))
+
+# Split sample
+train_idx <- sample(nrow(dd), round(0.8 * nrow(dd)), replace = FALSE)
+train_dt <- dd[train_idx,]
+test_dt <- dd[-train_idx,]
+
+# check the levels to make sure future imputations are meaningful
+unique(train_dt$educat)
+unique(train_dt$ethnic)
+unique(train_dt$race)
+unique(test_dt$educat)
+unique(test_dt$ethnic)
+unique(test_dt$race)
+
+# impute some missing (these must be done separately to avoid information leakage
+ train_dt <- train_dt  %>% 
+   mutate_all(~ifelse(is.na(.), median(., na.rm = TRUE), .))
+
+ test_dt <- test_dt %>% 
+   mutate_all(~ifelse(is.na(.), median(., na.rm = TRUE), .))
+
+ # Clean up some rare categories
+train_dt$educat[train_dt$educat > 90] <- NA
+train_dt$ethnic[train_dt$ethnic > 90] <- NA
+train_dt$race[train_dt$race > 90] <- NA
+test_dt$educat[test_dt$educat > 90] <- NA
+test_dt$ethnic[test_dt$ethnic > 90] <- NA
+test_dt$race[test_dt$race > 90] <- NA
+
+#impute the mode for these features
+train_dt <- impute_mode(train_dt)
+test_dt <- impute_mode(test_dt)
+
+# check to see if the mode is within the correct categories
+unique(train_dt$educat)
+unique(train_dt$ethnic)
+unique(train_dt$race)
+unique(test_dt$educat)
+unique(test_dt$ethnic)
+unique(test_dt$race)
+
+#last check for any null values  
+colSums(is.na(train_dt))
+colSums(is.na(test_dt))
+
+
+# Confirm even event rates (or close to it)
+mean(train_dt$cancer)
+mean(test_dt$cancer)
+
+
+```
+Summarize the data.
+
+```{r  summdata}
+dd<- rbind(train_dt, test_dt)
+# change the category names 
+dd$educat = ifelse(dd$educat  == 1, '8th grade or less',ifelse(dd$educat  == 2, '9th-11th grade',  ifelse(dd$educat == 3, 'High school graduate/GED',
+ifelse(dd$educat  == 4, 'Post high school training, excluding college', ifelse(dd$educat  == 5, 'Associate degree/ some college',                               ifelse(dd$educat == 6, 'Bachelors Degree', ifelse(dd$educat  == 7, 'Graduate School"', ifelse(dd$educat == 8, 'Other', dd$educat))))))))
+
+dd$gender = ifelse(dd$gender == 1, 'Male',ifelse(dd$gender  == 2, 'Female',  dd$gender))
+
+dd$ethnic = ifelse(dd$ethnic  == 1, 'Hispanic or Latino',ifelse(dd$ethnic  == 2, 'Neither Hispanic nor Latino',ifelse(dd$ethnic  == 7, 'Participant refused to answer',
+dd$ethnic )))
+
+dd$race = ifelse(dd$race  == 1, 'White',ifelse(dd$race  == 2, 'Black or African-American',  ifelse(dd$race == 3, 'Asian"',
+ifelse(dd$race  == 4, 'American Indian or Alaskan Native', ifelse(dd$race  == 5, 'Native Hawaiian or Other Pacific Islander',                               ifelse(dd$race == 6, 'More than one race',ifelse(dd$race ==  7, 'Participant refused to answer',dd$race)))))))
+                          
+table1(~ factor(cancer) + age + factor(ethnic) + factor(gender) + factor(race) + factor(educat) , data =  dd)
+
+table1(~ factor(cancer) + age + factor(ethnic) + factor(gender) + factor(race) + factor(educat) | dataset, data =  data.table(dd, 
+                                                                    dataset = ifelse(seq_along(1:nrow(dd)) %in% train_idx, 'train', 'test')))
+```
+
+
+```{r elasticnet, warning=FALSE}
+# Penalized log reg
+my_control <- trainControl(method = "boot",
+                           number = 100,
+                           classProbs = TRUE,
+                           returnData = TRUE,
+                           returnResamp = 'all',
+                           savePredictions = TRUE,
+                           summaryFunction = mnLogLoss,
+                           allowParallel = TRUE)
+
+my_control$sampling <- "smote"
+
+grid_en <- expand.grid(alpha = seq(0,1,.1),
+                       lambda = c(0.0001, 0.001, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 1, 3, 5))
+
+m_en <- train(make.names(as.factor(cancer)) ~as.factor(educat) + as.factor(rndgroup) + scale(age) + as.factor(ethnic) + as.factor(gender) +as.factor(race) + scale(weight) + as.factor(cigar) + scale(pkyr) + scale(smokeage) + scale(smokeyr) + 
+            as.factor(family_hist) + as.factor(cancer_hist) + as.factor(work_hist) + 
+            as.factor(disease_hist) + as.factor(scr_res_0)+ as.factor(scr_res_1)+ as.factor(scr_res_2) , data = train_dt, 
+                     method = 'glmnet',
+                     family = 'binomial',
+                     trControl = my_control,
+                     tuneGrid = grid_en,
+                     metric = 'logLoss', na.action = na.exclude)
+preds_en_test <- predict(m_en, type = 'prob', newdata = test_dt)[,2]
+plan(sequential)
+plot(m_en)
+```
+
+```{r}
+
+confusionMatrix(data = as.factor(as.numeric(preds_en_test>0.5)), 
+                reference = as.factor(test_dt$cancer))
+```
+
+
+```{r naive}
+# Naive Bayes
+grid_naive <- expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 0.3, 0.5, 0.8, 1), 
+                         adjust = c(0.25, 0.50, 0.75, 1, 1.25, 1.5, 1.75, 2.0))
+
+m_naive <- train(make.names(as.factor(cancer)) ~as.factor(educat) + as.factor(rndgroup) + scale(age) + as.factor(ethnic) + as.factor(gender) +as.factor(race) + scale(weight) + as.factor(cigar) + scale(pkyr) + scale(smokeage) + scale(smokeyr) +
+            as.factor(family_hist) + as.factor(cancer_hist) + as.factor(work_hist) +
+            as.factor(disease_hist) + as.factor(scr_res_0)+ as.factor(scr_res_1)+ as.factor(scr_res_2), data = train_dt,
+                   method = 'naive_bayes',
+                    trControl = my_control,
+                    tuneGrid = grid_naive,
+                    usepoisson = TRUE,
+                    metric = 'logLoss',  na.action = na.exclude)
+
+preds_naive_test <- predict(m_naive, type = 'prob', newdata = test_dt)[,2]
+plan(sequential)
+plot(m_naive)
+```
+
+```{r xgb, message=FALSE, warning=FALSE}
+# XGB
+grid_xgb <- expand.grid(nrounds = c(100, 200), 
+                        max_depth =  c(2, 4, 6, 8, 10),
+                        eta = c(0.01,0.1, 0.2, 0.3),
+                        gamma = 0, 
+                        colsample_bytree = 1, 
+                        min_child_weight = 1, 
+                        subsample = c(0.75,1))
+
+m_xgb <- train(make.names(as.factor(cancer)) ~as.factor(educat) + as.factor(rndgroup) + scale(age) + as.factor(ethnic) + as.factor(gender) + as.factor(race) + scale(weight) + as.factor(cigar) + scale(pkyr) + scale(smokeage) + scale(smokeyr) + 
+            as.factor(family_hist) + as.factor(cancer_hist) + as.factor(work_hist) + 
+            as.factor(disease_hist)+ as.factor(scr_res_0)+ as.factor(scr_res_1)+ as.factor(scr_res_2) ,
+                    method = 'xgbTree',
+                    trControl = my_control,
+                    tuneGrid = grid_xgb,
+                    metric = 'logLoss',
+                    data = train_dt)
+
+preds_xgb_test <- predict(m_xgb, type = 'prob', newdata = test_dt)[,2]
+
+# This parallel backend messes up the the bootstrapping of performance metrics later so turn it off
+plan(sequential)
+plot(m_xgb)
+
+```
+
+```{r}
+
+confusionMatrix(data = as.factor(as.numeric(preds_xgb_test>0.5)), 
+                reference = as.factor(test_dt$cancer))
+```
+
+
+```{r aggregateresults, warning=FALSE}
+# Final results
+nlst_res <- data.table(y = test_dt$cancer,
+                          en = preds_en_test,
+                          naive = preds_naive_test,
+                          xgb = preds_xgb_test)
+
+
+fwrite(nlst_res, 'output/nlst_res.csv')
+
+# Performance plots
+cal_pl <- calib_plot(y ~  en  +xgb+naive , data = nlst_res) 
+roc_plot(y ~ en  +xgb+naive , data = nlst_res) 
+pr_pl <- pr_plot(y ~ en +xgb+naive , data = nlst_res) 
+
+
+#plot_grid(pr_pl, cal_pl, labels = "AUTO")
+
+cowplot::plot_grid(
+   cowplot::plot_grid(
+    pr_pl + scale_color_discrete(guide = FALSE),
+    cal_pl + scale_color_discrete(guide = FALSE),
+    ncol = 2, align = "v"
+   ),
+   cowplot::get_legend(cal_pl + scale_shape(guide = FALSE) + 
+      theme(legend.position = "bottom")),
+   ncol=1, rel_heights=c(.85, .15))
+  ggsave('exhibit/fig_nlst_perf_all.png', width = 12, height = 7, dpi = 600)
+
+```
+
+```{r}
+
+# SCaled brier score
+print(paste('Scaled brier score for the EN model: ',  sbrier(preds_en_test, nlst_res$y)))
+print(paste('Scaled brier score for the Naive Bayes model: ',  sbrier(preds_naive_test, nlst_res$y)))
+print(paste('Scaled brier score for the XGB model: ',  sbrier(preds_xgb_test, nlst_res$y)))
+
+# auc
+print(paste('AUC for the EN model: ', auc(preds_en_test, nlst_res$y)))
+print(paste('AUC for the Naive Bayes model: ', auc(preds_naive_test, nlst_res$y)))
+print(paste('AUC for the XGBoost model: ', auc(preds_xgb_test, nlst_res$y)))
+
+# logloss
+print(paste('logloss for the EN model: ', lloss(preds_en_test, nlst_res$y)))
+print(paste('logloss for the Naive Bayes model: ', lloss(preds_naive_test, nlst_res$y)))
+print(paste('logloss for the XGBoost model: ', lloss(preds_xgb_test, nlst_res$y)))
+
+
+```
+
+Now make weighted DCA plots.
+
+
+```{r dcaplots}
+
+########## NLST
+weight_list <- c(1/8, 1/7, 1/6, 1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5, 6, 7, 8)
+dca_list <- lapply(weight_list, function(w) {
+  nb_plot(y ~ en + xgb + naive, data = nlst_res, weight = w) + 
+    theme(legend.position="none", text = element_text(size = 10)) +
+                     ggtitle(paste0('Weight: ', fractions(w))) + coord_fixed(ratio = 3) +
+    scale_color_nejm(limits = c('en', 'naive', 'xgb',
+                                'Treat all', 'Treat none', 'Treat omnisciently'),
+                     labels = c('Elastic net', 'Naive Bayes', 'XGBoost',
+                                'Treat all', 'Treat none', 'Treat omnisciently'))
+})
+# Collect legends with cowplot: https://wilkelab.org/cowplot/articles/shared_legends.html
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  dca_list[[1]] + theme(legend.position = "bottom") +
+    scale_color_nejm(limits = c('en', 'naive', 'xgb',
+                                'Treat all', 'Treat none', 'Treat omnisciently'),
+                     labels = c('Elastic net', 'Naive Bayes', 'XGBoost',
+                                'Treat all', 'Treat none', 'Treat omnisciently'))
+    
+)
+pg <- plot_grid(plotlist = dca_list, 
+          ncol = 5, align = "hv")
+plot_grid(pg, legend, ncol = 1, rel_heights = c(1, .1))
+
+ggsave('exhibit/fig_nlst_dca_all.png', width = 12, height = 12, dpi = 600)
+
+```
+

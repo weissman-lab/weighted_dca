@@ -1,0 +1,72 @@
+---
+title: "HiRID Performance and Analysis"
+author: "Gary E. Weissman, MD, MSHP"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+This document loads the predicted probabilities from the hirid models and generates performance measures.
+
+
+## Analysis
+
+```{r libs}
+library(data.table)
+library(gmish)
+library(cowplot)
+library(ggsci)
+library(ggplot2)
+library(MASS)
+set.seed(1234)
+```
+
+```{r loaddata}
+hirid_res <- fread('output/hirid_test_predictions.csv.gz')
+```
+
+```{r getperf}
+with(hirid_res, make_perf_df(mod_en, vented)) |> knitr::kable()
+with(hirid_res, make_perf_df(mod_naive, vented)) |> knitr::kable()
+with(hirid_res, make_perf_df(mod_xgb, vented)) |> knitr::kable()
+```
+
+## Also make updated figure for ATS Abstract 2023
+
+```{r atsfig}
+
+# Set range of weights
+weight_list <- c(1/8, 1/7, 1/6, 1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5, 6, 7, 8)
+dca_list <- lapply(weight_list, function(w) {
+  nb_plot(vented ~ mod_en + mod_naive + mod_xgb, weight = w,
+                     data = hirid_res) +
+    theme(legend.position="none", text = element_text(size = 10)) +
+                     ggtitle(paste0('Weight: ', fractions(w)))  +
+    scale_color_nejm(limits = c('mod_en', 'mod_naive', 'mod_xgb',
+                                'Treat all', 'Treat none', 'Treat omnisciently'),
+                     labels = c('Elastic net', 'Naive Bayes', 'XGBoost',
+                                'Treat all', 'Treat none', 'Treat omnisciently'))
+})
+# Collect legends with cowplot: https://wilkelab.org/cowplot/articles/shared_legends.html
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  dca_list[[1]] + theme(legend.position = "bottom") +
+    scale_color_nejm(limits = c('mod_en', 'mod_naive', 'mod_xgb',
+                                'Treat all', 'Treat none', 'Treat omnisciently'),
+                     labels = c('Elastic net', 'Naive Bayes', 'XGBoost',
+                                'Treat all', 'Treat none', 'Treat omnisciently'))
+
+)
+pg <- plot_grid(plotlist = dca_list,
+          ncol = 5, align = "hv")
+plot_grid(pg, legend, ncol = 1, rel_heights = c(1, .1))
+
+#ggsave('exhibit/fig_hirid_dca_all_ats.jpg', width = 12, height = 12, dpi = 600)
+ggsave('exhibits/fig_hirid_dca_all.png', width = 12, height = 12, dpi = 600)
+```

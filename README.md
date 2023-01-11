@@ -20,19 +20,23 @@ Weissman GE and Faraji Z. When does a decision curve analysis benefit from an ex
 
 # Explanation of files
 
-* 00_nlst_data_preprocess.py - This file preprocess the data for NLST case study by creating new features and dropping unwanted features. The final output is saved as a cvs file and laoded in the 03_nlst_netbenefit.Rmd file for further processing and modeling. 
+* 00_nlst_data_preprocess.py - This file preprocesses the raw data for NLST case study by creating new features and dropping unwanted features. The final output is saved as a csv file and loaded in the 03_nlst_netbenefit.Rmd file for further processing and modeling. Raw data can be downloaded from here: https://cdas.cancer.gov/nlst/
 
-* 01_hirid_netbenefit.Rmd - This file is using the HIRID case study to build prediction models (Elastic Net, XGBoost, Naive Bayes) and visualize the DCA plot for various weights. The predicted probabilities of the models are saved in the output folder. The performance and DCA plots are saved in the exhibit folder. 
-* 01_hirid_netbenefit.html - this file is the output of 01_hirid_netbenefit.Rmd in the HTML format which includes the plots and results. 
+* 01_hirid_netbenefit.Rmd - This file is using the HIRID case study to build prediction models (Elastic Net, XGBoost, Naive Bayes) and visualize the DCA plot for various weights. The predicted probabilities of the models are saved in the output folder. The performance and DCA plots are saved in the exhibits folder. 
+
+* 01_hirid_netbenefit.html - This file is the output of 01_hirid_netbenefit.Rmd in the HTML format which includes the plots and results. 
 
 * 02_hirid_extra_analysis.Rmd  - This file loads the predicted probabilities from the HIRID models and generates performance measures.
+
 * 02_hirid_extra_analysis.html- This file is the output of 02_hirid_extra_analysis.Rmd in the HTML format which includes the plots and results. 
 
-* 03_nlst_netbenefit.Rmd - This file is using the NLST case study to build prediction models (Elastic Net, XGBoost, Naive Bayes) and visualize the DCA plot for various weights. The predicted probabilities of the models are saved in the output folder. The performance and DCA plots are saved in the exhibit folder. 
+* 03_nlst_netbenefit.Rmd - This file is using the NLST case study to build prediction models (Elastic Net, XGBoost, Naive Bayes) and visualize the DCA plot for various weights. The predicted probabilities of the models are saved in the output folder. The performance and DCA plots are saved in the exhibits folder. 
+
 * 03_nlst_netbenefit.html - this file is the output of 03_nlst_netbenefit.Rmd in the HTML format which includes the plots and results. 
 
 * 05_fig_perf_comb.Rmd - This file creates a combined performance plot for both case studies which shows the calibration and precision-recall plots together. 
-* 05_fig_perf_comb.html - this file is the output of 05_fig_perf_comb.Rmd in the HTML format which includes the plots and results. 
+
+* 05_fig_perf_comb.html - This file is the output of 05_fig_perf_comb.Rmd in the HTML format which includes the plots and results. 
 
 * runall.sh - This is a bash script to run and compile everything at once. 
 
